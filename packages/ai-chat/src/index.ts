@@ -2954,7 +2954,9 @@ export class AIChatAgent<
    * teardown that runs on `chat-clear`.
    */
   protected abortAllRequests(reason?: unknown): void {
-    this._abortRegistry.destroyAll(reason);
+    // A stop of everything: it also drops the continuations that were
+    // waiting on the turn running now.
+    this._turns.stopAll(reason);
   }
 
   /**
