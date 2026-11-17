@@ -5,6 +5,7 @@ import {
   pinnedOr,
   prepareTurnMessages,
   runServerTurn,
+  toSaveMessagesResult,
   type ServerChatTurn,
   type ServerTurnParts
 } from "../server-turn";
@@ -254,7 +255,7 @@ describe("runServerTurn", () => {
         }
       })
     );
-    expect(result).toEqual({ status: "skipped" });
+    expect(result).toEqual({ status: "skipped", reason: "cleared" });
     expect(log).not.toContain("s1:onAborted");
   });
 
@@ -385,6 +386,33 @@ describe("runServerTurn", () => {
     expect(log).toEqual([]);
   });
 
+  it("carries the reason of a turn its prepare declines as skipped", async () => {
+    const result = await runServerTurn(
+      parts,
+      turn("s1", {
+        prepare: async () => ({
+          declined: "skipped",
+          reason: "awaiting-client"
+        })
+      })
+    );
+    expect(result).toEqual({ status: "skipped", reason: "awaiting-client" });
+    expect(log).toEqual([]);
+    // The caller gets the reason, and no request id: nothing ran under it.
+    expect(toSaveMessagesResult("s1", result)).toEqual({
+      requestId: "",
+      status: "skipped",
+      reason: "awaiting-client"
+    });
+    expect(
+      toSaveMessagesResult("s2", { status: "skipped", reason: "cleared" })
+    ).toEqual({ requestId: "s2", status: "skipped", reason: "cleared" });
+    expect(toSaveMessagesResult("s3", { status: "completed" })).toEqual({
+      requestId: "s3",
+      status: "completed"
+    });
+  });
+
   it("lets a decline stand when the chat was reset while prepare waited", async () => {
     const result = await runServerTurn(
       parts,
@@ -430,7 +458,7 @@ describe("runServerTurn", () => {
     parts.aborts.destroyAll();
     release();
 
-    expect(await pending).toEqual({ status: "skipped" });
+    expect(await pending).toEqual({ status: "skipped", reason: "cleared" });
     expect(log).toEqual([]);
     expect(parts.aborts.size).toBe(0);
     // The listener is gone too, though the turn's body never ran.
@@ -449,7 +477,7 @@ describe("runServerTurn", () => {
         }
       })
     );
-    expect(result).toEqual({ status: "skipped" });
+    expect(result).toEqual({ status: "skipped", reason: "cleared" });
     expect(log).toEqual([]);
   });
 
@@ -463,7 +491,7 @@ describe("runServerTurn", () => {
         }
       })
     );
-    expect(result).toEqual({ status: "skipped" });
+    expect(result).toEqual({ status: "skipped", reason: "cleared" });
     expect(log).toEqual(["s1:prepare"]);
   });
 
@@ -478,7 +506,7 @@ describe("runServerTurn", () => {
         }
       })
     );
-    expect(result).toEqual({ status: "skipped" });
+    expect(result).toEqual({ status: "skipped", reason: "cleared" });
     expect(log).not.toContain("s1:onAborted");
   });
 
