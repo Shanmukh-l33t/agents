@@ -288,6 +288,7 @@ export {
 export {
   persistRepairedTranscript,
   repairInterruptedToolParts,
+  replyIsEmpty,
   settleInterruptedReply,
   settleReplyBeforeRecovery,
   streamChunksFinished,
@@ -307,6 +308,7 @@ export {
  */
 export {
   continuationWaitsOnClient,
+  replyToContinueIsEmpty,
   interruptedToolPartAsError,
   INTERRUPTED_TOOL_ERROR_TEXT,
   repairTranscriptBeforeTurn,

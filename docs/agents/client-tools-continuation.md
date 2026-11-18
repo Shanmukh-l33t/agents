@@ -192,17 +192,28 @@ A continuation turn settles the earlier replies the same way. In the message it 
 
 `reason` says why a turn was skipped:
 
-| `reason`                | Meaning                                                             |
-| ----------------------- | ------------------------------------------------------------------- |
-| `"awaiting-client"`     | The reply still waits on a client for a tool result or an approval. |
-| `"nothing-to-continue"` | There is no assistant message to continue.                          |
-| `"cleared"`             | The chat was cleared before or while the turn ran.                  |
+| `reason`                | Meaning                                                                                                  |
+| ----------------------- | -------------------------------------------------------------------------------------------------------- |
+| `"awaiting-client"`     | The reply still waits on a client for a tool result or an approval.                                      |
+| `"nothing-to-continue"` | There is no assistant message to continue, or the last one [holds nothing](#a-reply-that-holds-nothing). |
+| `"cleared"`             | The chat was cleared before or while the turn ran.                                                       |
 
 The tools a turn offers the model are the `clientTools` of the request that started it. A request that sends none clears the stored ones. A tool result that settles its call and lists `clientTools` replaces them. A result that settles nothing, such as a late duplicate from another tab, leaves them.
 
 ## Reasoning at the end of a reply
 
-A reply that is cut off right after the model's reasoning ends in a reasoning part. Anthropic rejects a request in which an assistant message's final block is a thinking block, whether a user message follows it or not, so one such reply would fail every later turn. The reasoning a reply ends in is removed when a cut-off reply is stored and before every turn. Reasoning that text or a tool call follows is kept.
+A reply that is cut off right after the model's reasoning ends in a reasoning part. Anthropic rejects a request in which an assistant message's final block is a thinking block, whether a user message follows it or not, so one such reply would fail every later turn. The reasoning a reply ends in is removed when a cut-off reply is stored and before every turn. Reasoning that text or a tool call follows is kept. A text part with no text goes with the reasoning: it is the start of an answer the model never wrote.
+
+### A reply that holds nothing
+
+A reply cut off while the model was still reasoning has nothing left once that reasoning is gone: no text, no tool call, nothing a client can show. The same is true of a reply cut off before the model produced anything, and of one that finished with no content. Such a reply is not stored, in `AIChatAgent` and in `Think`. The question stays the latest message, and recovery answers it again as it does for a turn that was cut off before it produced anything.
+
+One that is already stored (an earlier version stored it with its reasoning) is removed:
+
+- by the next turn that starts a new reply, and
+- by a recovery that was scheduled to continue it, which then answers the question again.
+
+Every connected client receives the message list without it. `continueLastTurn()` over such a reply returns `skipped` with the reason `nothing-to-continue` and changes nothing.
 
 ## Related Docs
 

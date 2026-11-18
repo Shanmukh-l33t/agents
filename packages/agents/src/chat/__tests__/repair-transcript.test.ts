@@ -3,6 +3,7 @@ import { convertToModelMessages, type UIMessage } from "ai";
 import {
   persistRepairedTranscript,
   repairInterruptedToolParts,
+  replyIsEmpty,
   settleInterruptedReply,
   settleReplyBeforeRecovery,
   streamChunksFinished,
@@ -424,6 +425,7 @@ describe("streamChunksFinished", () => {
 /** A sink that records what it was asked to store and report. */
 function recordingSink() {
   const persisted: Array<{ changed: string[]; repaired: string[] }> = [];
+  const removed: Array<{ ids: string[]; repaired: string[] }> = [];
   const events: Array<Parameters<RepairedTranscriptSink["emitRepaired"]>[0]> =
     [];
   const sink: RepairedTranscriptSink = {
@@ -433,9 +435,12 @@ function recordingSink() {
         repaired: repaired.map((m) => m.id)
       });
     },
+    remove: async (ids, repaired) => {
+      removed.push({ ids, repaired: repaired.map((m) => m.id) });
+    },
     emitRepaired: (event) => void events.push(event)
   };
-  return { sink, persisted, events };
+  return { sink, persisted, removed, events };
 }
 
 const pendingCall = (id: string, tool = "search") =>
@@ -445,6 +450,15 @@ const pendingCall = (id: string, tool = "search") =>
     state: "input-available",
     input: {}
   });
+const reasoningOnly = (id: string) =>
+  ({
+    id,
+    role: "assistant",
+    parts: [
+      { type: "step-start" },
+      { type: "reasoning", text: "Let me think", state: "streaming" }
+    ]
+  }) as ChatMessage;
 const textMsg = (id: string, role: "assistant" | "user" = "user") =>
   ({ id, role, parts: [{ type: "text", text: id }] }) as ChatMessage;
 
@@ -470,6 +484,42 @@ describe("persistRepairedTranscript", () => {
     await persistRepairedTranscript(messages, repair(messages), sink);
 
     expect(persisted).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it("removes a reply the repair left empty, and does not store it", async () => {
+    const messages = [textMsg("u1"), reasoningOnly("a1"), textMsg("u2")];
+    const { sink, persisted, removed, events } = recordingSink();
+
+    const kept = await persistRepairedTranscript(
+      messages,
+      repair(messages),
+      sink
+    );
+
+    expect(persisted).toEqual([]);
+    expect(removed).toEqual([{ ids: ["a1"], repaired: ["u1", "u2"] }]);
+    expect(kept.map((m) => m.id)).toEqual(["u1", "u2"]);
+    expect(events).toEqual([
+      {
+        removedToolCalls: 0,
+        normalizedInputs: 0,
+        toolCallIds: [],
+        removedReasoningParts: 1
+      }
+    ]);
+  });
+
+  it("removes a reply that was stored with no parts", async () => {
+    const empty = { id: "a1", role: "assistant", parts: [] } as ChatMessage;
+    const messages = [textMsg("u1"), empty, textMsg("u2")];
+    const { sink, persisted, removed, events } = recordingSink();
+
+    await persistRepairedTranscript(messages, repair(messages), sink);
+
+    expect(persisted).toEqual([]);
+    expect(removed).toEqual([{ ids: ["a1"], repaired: ["u1", "u2"] }]);
+    // Nothing was repaired, so there is no repaired event.
     expect(events).toEqual([]);
   });
 });
@@ -519,6 +569,103 @@ describe("settleReplyBeforeRecovery", () => {
     );
 
     expect(persisted).toEqual([]);
+  });
+});
+
+describe("settleReplyBeforeRecovery, a reply that holds nothing", () => {
+  const options = {
+    repairPart: flipToError,
+    clientToolNames: new Set<string>()
+  };
+
+  it("removes a reply cut off in its reasoning and says so", async () => {
+    const messages = [textMsg("u1"), reasoningOnly("a1")];
+    const { sink, persisted, removed } = recordingSink();
+
+    const outcome = await settleReplyBeforeRecovery(
+      messages,
+      "a1",
+      options,
+      sink
+    );
+
+    expect(outcome).toBe("removed");
+    expect(persisted).toEqual([]);
+    expect(removed).toEqual([{ ids: ["a1"], repaired: ["u1"] }]);
+  });
+
+  it("removes a reply stored with no parts", async () => {
+    const empty = { id: "a1", role: "assistant", parts: [] } as ChatMessage;
+    const { sink, removed } = recordingSink();
+
+    expect(
+      await settleReplyBeforeRecovery(
+        [textMsg("u1"), empty],
+        "a1",
+        options,
+        sink
+      )
+    ).toBe("removed");
+    expect(removed).toEqual([{ ids: ["a1"], repaired: ["u1"] }]);
+  });
+
+  it("keeps a reply that has text", async () => {
+    const { sink, removed } = recordingSink();
+
+    expect(
+      await settleReplyBeforeRecovery(
+        [textMsg("u1"), textMsg("a1", "assistant")],
+        "a1",
+        options,
+        sink
+      )
+    ).toBeUndefined();
+    expect(removed).toEqual([]);
+  });
+});
+
+describe("replyIsEmpty", () => {
+  const assistant = (...parts: Array<Record<string, unknown>>) => ({
+    role: "assistant",
+    parts
+  });
+
+  it("is true for a reply with nothing to show and nothing to send", () => {
+    expect(replyIsEmpty(assistant())).toBe(true);
+    expect(replyIsEmpty(assistant({ type: "step-start" }))).toBe(true);
+    expect(
+      replyIsEmpty(
+        assistant({ type: "step-start" }, { type: "text", text: "" })
+      )
+    ).toBe(true);
+    expect(replyIsEmpty(assistant({ type: "reasoning", text: "" }))).toBe(true);
+  });
+
+  it("is false for anything a client shows or a request carries", () => {
+    expect(replyIsEmpty(assistant({ type: "text", text: "a" }))).toBe(false);
+    expect(replyIsEmpty(assistant({ type: "reasoning", text: "hm" }))).toBe(
+      false
+    );
+    expect(
+      replyIsEmpty(
+        assistant({
+          type: "tool-pick",
+          toolCallId: "c",
+          state: "input-available"
+        })
+      )
+    ).toBe(false);
+    expect(replyIsEmpty(assistant({ type: "data-progress", data: 1 }))).toBe(
+      false
+    );
+    expect(replyIsEmpty(assistant({ type: "source-url", url: "x" }))).toBe(
+      false
+    );
+    expect(replyIsEmpty(assistant({ type: "file", url: "x" }))).toBe(false);
+  });
+
+  it("is false for a user message", () => {
+    expect(replyIsEmpty({ role: "user", parts: [] })).toBe(false);
   });
 });
 
@@ -588,6 +735,29 @@ describe("stripTrailingReasoning", () => {
     return Array.isArray(last?.content) ? last.content.at(-1)?.type : undefined;
   }
 
+  it("removes an empty text part with the reasoning in front of it", () => {
+    // Cut off between `text-start` and the first delta. A continuation
+    // would write its answer into the empty part, in front of its own
+    // reasoning.
+    const emptyText = { type: "text", text: "", state: "streaming" };
+    expect(
+      types(stripTrailingReasoning(assistant(step, reasoning(), emptyText)))
+    ).toEqual([]);
+    expect(
+      types(
+        stripTrailingReasoning(
+          assistant(step, tool, step, reasoning(), emptyText)
+        )
+      )
+    ).toEqual(["step-start", "tool-pick"]);
+  });
+
+  it("leaves a reply cut off in its reasoning with no parts", () => {
+    const stripped = stripTrailingReasoning(assistant(step, reasoning()));
+    expect(stripped.parts).toEqual([]);
+    expect(replyIsEmpty(stripped)).toBe(true);
+  });
+
   it("removes a last step that holds only reasoning", async () => {
     const message = assistant(step, tool, step, reasoning());
     // As stored, the request's last assistant block is the reasoning.
@@ -631,7 +801,7 @@ describe("stripTrailingReasoning", () => {
     }
   });
 
-  it("keeps parts that send nothing to the model, and treats empty text as nothing", () => {
+  it("keeps parts a client shows, and removes empty text with the reasoning", () => {
     const source = { type: "source-url", sourceId: "s", url: "https://x.y" };
     expect(
       types(
@@ -639,7 +809,7 @@ describe("stripTrailingReasoning", () => {
           assistant(step, text(), step, reasoning(), text(""), source)
         )
       )
-    ).toEqual(["step-start", "text", "step-start", "text", "source-url"]);
+    ).toEqual(["step-start", "text", "step-start", "source-url"]);
   });
 
   it("leaves user messages and replies without trailing reasoning alone", () => {
@@ -673,7 +843,10 @@ describe("stripTrailingReasoning", () => {
   });
 
   it("is reported with the repair, and stored like any other change", async () => {
-    const messages = [textMsg("u1"), assistant(step, reasoning())];
+    const messages = [
+      textMsg("u1"),
+      assistant(step, text(), step, reasoning())
+    ];
     const result = repair(messages);
     expect(result.removedReasoningParts).toBe(1);
     expect(result.removedToolCalls).toBe(0);

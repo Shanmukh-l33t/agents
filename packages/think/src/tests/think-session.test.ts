@@ -1337,7 +1337,9 @@ describe("Think — abort", () => {
       "partial4 "
     ]);
 
-    await agent.testChatWithAbort("Abort and persist", 2);
+    // After the first text chunk. A reply stopped before it has any content
+    // holds nothing and is not stored.
+    await agent.testChatWithAbort("Abort and persist", 4);
 
     const history = await agent.getStoredMessages();
     expect(history).toHaveLength(2);
@@ -1350,11 +1352,22 @@ describe("Think — abort", () => {
     expect(assistantMsg.parts.length).toBeGreaterThan(0);
   });
 
+  it("stores no reply for a turn stopped before it has any content", async () => {
+    const agent = await freshAgent("abort-empty");
+    await agent.setMultiChunkResponse(["partial1 ", "partial2 "]);
+
+    // Stopped after `start` and `start-step`: nothing a client can show.
+    await agent.testChatWithAbort("Abort before content", 2);
+
+    const history = (await agent.getStoredMessages()) as UIMessage[];
+    expect(history.map((message) => message.role)).toEqual(["user"]);
+  });
+
   it("should recover and chat normally after abort", async () => {
     const agent = await freshAgent("abort-recover");
 
     await agent.setMultiChunkResponse(["a ", "b ", "c ", "d "]);
-    await agent.testChatWithAbort("Abort this", 2);
+    await agent.testChatWithAbort("Abort this", 4);
 
     await agent.clearMultiChunkResponse();
     const result = await agent.testChat("Normal after abort");

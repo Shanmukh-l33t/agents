@@ -10,6 +10,8 @@
 import type { UIMessage } from "ai";
 import {
   repairInterruptedToolParts,
+  replyIsEmpty,
+  stripTrailingReasoning,
   type RepairInterruptedToolPartsOptions,
   type RepairInterruptedToolPartsResult
 } from "./repair-transcript";
@@ -95,7 +97,9 @@ export function repairTranscriptBeforeTurn(
       return !kept;
     },
     // The last message's approved calls are always kept.
-    repairApprovalResponded: true
+    repairApprovalResponded: true,
+    // A continuation turn writes into the last message.
+    keepEmptyLastMessage: continuation
   });
   return { ...result, keptToolCallIds };
 }
@@ -118,6 +122,23 @@ export function continuationWaitsOnClient(
     last.parts.some((part) =>
       partAwaitsClientInteraction(part, clientToolNames)
     )
+  );
+}
+
+/**
+ * Whether the message a continuation turn would continue holds nothing once
+ * the reasoning it ends in is gone ({@link replyIsEmpty}). There is nothing
+ * to continue: the before-turn repair would strip it and leave an empty
+ * message stored. A host asks this with {@link continuationWaitsOnClient},
+ * before the turn stores anything. The next turn that starts a new reply
+ * removes the message.
+ */
+export function replyToContinueIsEmpty(
+  messages: ReadonlyArray<UIMessage>
+): boolean {
+  const last = messages.at(-1);
+  return (
+    last?.role === "assistant" && replyIsEmpty(stripTrailingReasoning(last))
   );
 }
 

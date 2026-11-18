@@ -54,6 +54,9 @@ interface ChatRecoveryTestStub {
     ageMs?: number
   ): Promise<void>;
   triggerInterruptedStreamCheck(): Promise<void>;
+  runRecoveryContinueForTest(options?: {
+    targetAssistantId?: string;
+  }): Promise<void>;
   insertInterruptedFiber(name: string, snapshot?: unknown): Promise<void>;
   triggerFiberRecovery(): Promise<void>;
   getRecoveryContexts(): Promise<unknown[]>;
@@ -244,6 +247,111 @@ describe("continueLastTurn", () => {
       .join("");
     expect(allText).toContain("Once upon a time there was");
     expect(allText).toContain("Continued response.");
+  });
+
+  // A reply left with nothing a client can show and nothing a model request
+  // can carry is not stored, and one that is stored is removed.
+  describe("a reply that holds nothing", () => {
+    const question = {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Think about it" }]
+    } as ChatMessage;
+    const reasoningOnly = {
+      id: "assistant-reasoning",
+      role: "assistant",
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", text: "Let me think", state: "streaming" }
+      ]
+    } as ChatMessage;
+    const reasoningChunks = [
+      { type: "start", messageId: "assistant-partial" },
+      { type: "start-step" },
+      { type: "reasoning-start" },
+      { type: "reasoning-delta", delta: "Let me think" }
+    ];
+    const asStream = (chunks: Array<Record<string, unknown>>) =>
+      chunks.map((chunk, index) => ({ body: JSON.stringify(chunk), index }));
+
+    it("does not store a reply cut off while the model was still reasoning", async () => {
+      const agentStub = await getTestAgent(crypto.randomUUID());
+      await agentStub.setRecoveryOverride({ continue: false });
+      await agentStub.persistMessages([question]);
+
+      await agentStub.insertInterruptedStream(
+        "reasoning-stream",
+        "reasoning-request",
+        asStream(reasoningChunks)
+      );
+      await agentStub.triggerInterruptedStreamCheck();
+
+      const messages =
+        (await agentStub.getPersistedMessages()) as ChatMessage[];
+      expect(messages.map((message) => message.id)).toEqual(["user-1"]);
+    });
+
+    it("does not store a reply cut off right after its text part opened", async () => {
+      const agentStub = await getTestAgent(crypto.randomUUID());
+      await agentStub.setRecoveryOverride({ continue: false });
+      await agentStub.persistMessages([question]);
+
+      // An empty text part is not content. Stored, a continuation would
+      // write its answer into it, in front of its own reasoning.
+      await agentStub.insertInterruptedStream(
+        "empty-text-stream",
+        "empty-text-request",
+        asStream([
+          ...reasoningChunks,
+          { type: "reasoning-end" },
+          { type: "text-start" }
+        ])
+      );
+      await agentStub.triggerInterruptedStreamCheck();
+
+      const messages =
+        (await agentStub.getPersistedMessages()) as ChatMessage[];
+      expect(messages.map((message) => message.id)).toEqual(["user-1"]);
+    });
+
+    it("has nothing to continue in a stored reply that is only reasoning", async () => {
+      const agentStub = await getTestAgent(crypto.randomUUID());
+      await agentStub.persistMessages([question, reasoningOnly]);
+
+      const result = await agentStub.callContinueLastTurn();
+
+      expect(result).toMatchObject({
+        status: "skipped",
+        reason: "nothing-to-continue"
+      });
+      expect(await agentStub.getOnChatMessageCallCount()).toBe(0);
+      // A skipped call leaves the chat as it found it.
+      const messages =
+        (await agentStub.getPersistedMessages()) as ChatMessage[];
+      expect(messages.at(-1)).toMatchObject(reasoningOnly);
+    });
+
+    it("a recovery that would continue it removes it and answers the question again", async () => {
+      const agentStub = await getTestAgent(crypto.randomUUID());
+      await agentStub.persistMessages([question, reasoningOnly]);
+
+      await agentStub.runRecoveryContinueForTest({
+        targetAssistantId: "assistant-reasoning"
+      });
+      await agentStub.waitForIdleForTest();
+
+      expect(await agentStub.getOnChatMessageCallCount()).toBe(1);
+      const messages =
+        (await agentStub.getPersistedMessages()) as ChatMessage[];
+      expect(messages.map((message) => message.role)).toEqual([
+        "user",
+        "assistant"
+      ]);
+      expect(messages[1].id).not.toBe("assistant-reasoning");
+      expect(JSON.stringify(messages[1].parts)).toContain(
+        "Continued response."
+      );
+    });
   });
 
   it("should merge text into existing streaming text part (not create a new block)", async () => {

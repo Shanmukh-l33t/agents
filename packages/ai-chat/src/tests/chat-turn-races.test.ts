@@ -713,6 +713,58 @@ describe("chat turn races", () => {
     ws.close(1000);
   });
 
+  it("a new question removes an earlier reply that held only reasoning, in every tab", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const { ws: otherTab } = await connectChatWS(
+      `/agents/test-chat-agent/${room}`
+    );
+    const seen = record(ws);
+    const seenByOtherTab = record(otherTab);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    // Cut off while the model was still reasoning, and stored as it was.
+    // Without its reasoning the reply holds nothing.
+    const cutOff: ChatMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", text: "Let me think", state: "streaming" }
+      ] as ChatMessage["parts"]
+    };
+    await agent.persistMessages([user1, cutOff]);
+
+    sendChatRequest(ws, "req-2", [user1, cutOff, user2]);
+    await waitUntil(() => responses(seen, "req-2").some((m) => m.done));
+    await agent.waitForIdleForTest();
+
+    const stored = (await agent.getPersistedMessages()) as ChatMessage[];
+    expect(stored.map((message) => message.id)).not.toContain("assistant-1");
+    expect(stored.slice(0, 2).map((message) => message.id)).toEqual([
+      "user-1",
+      "user-2"
+    ]);
+    // The other tab is told with the whole list, so it drops the reply.
+    const lists = seenByOtherTab.filter(
+      (
+        m
+      ): m is Extract<
+        OutgoingMessage,
+        { type: MessageType.CF_AGENT_CHAT_MESSAGES }
+      > => m.type === MessageType.CF_AGENT_CHAT_MESSAGES
+    );
+    expect(
+      lists.some(
+        (m) =>
+          m.messages.some((message) => message.id === "user-2") &&
+          !m.messages.some((message) => message.id === "assistant-1")
+      )
+    ).toBe(true);
+    expect(await agent.getEndsInReasoningAtModelCallForTest()).toEqual([]);
+    ws.close(1000);
+    otherTab.close(1000);
+  });
+
   it("a reply stopped right after the model's reasoning is stored without it", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);

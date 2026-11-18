@@ -42,6 +42,10 @@ type Scenario = {
   /** Runs while the recovered turn runs. */
   duringTurn?: (context: Harness) => void | Promise<void>;
   withSettle?: boolean;
+  /** The settle removed the reply: it held nothing. */
+  settleRemovesReply?: boolean;
+  /** What the retry's leaf check returns. */
+  retryLeaf?: RecoveryLeafCheck;
   /** The latest stored message. Defaults to an assistant reply. */
   latestMessage?: { id: string; role: string };
 };
@@ -200,6 +204,18 @@ function setup(scenario: Scenario = {}) {
       ? {
           settleCutOffReply: async () => {
             log.push("settle");
+            return scenario.settleRemovesReply ? "removed" : undefined;
+          },
+          retryLostReply: {
+            checkLeaf: async () => {
+              log.push("retry-leaf");
+              return scenario.retryLeaf ?? { moved: false };
+            },
+            runTurn: async (signal) => {
+              log.push("retry-turn");
+              turnSignals.push(signal);
+              return scenario.result ?? { status: "completed" };
+            }
           }
         }
       : {})
@@ -244,6 +260,43 @@ describe("runRecoveryCallback", () => {
     expect(scoped).toEqual(["user-1"]);
     // A request outside the callback never inherits the ids.
     expect(outside).toBeUndefined();
+  });
+});
+
+describe("runRecoveredTurn, a reply the settle removed", () => {
+  it("retries the question and does not go on to continue", async () => {
+    const t = setup({ withSettle: true, settleRemovesReply: true });
+    await t.run();
+
+    expect(t.log).toContain("retry-leaf");
+    expect(t.log).toContain("retry-turn");
+    expect(t.log).not.toContain("leaf");
+    expect(t.log).not.toContain("turn");
+    expect(t.log).toContain("after-outcome");
+  });
+
+  it("skips when the question is no longer the latest message", async () => {
+    const t = setup({
+      withSettle: true,
+      settleRemovesReply: true,
+      retryLeaf: { moved: true, reason: "no_unanswered_user_message" }
+    });
+    await t.run();
+
+    expect(t.log).not.toContain("retry-turn");
+    expect(t.log).not.toContain("turn");
+    expect(t.incident()).toMatchObject({
+      status: "skipped",
+      reason: "no_unanswered_user_message"
+    });
+  });
+
+  it("continues as before when the reply was kept", async () => {
+    const t = setup({ withSettle: true });
+    await t.run();
+
+    expect(t.log).toContain("turn");
+    expect(t.log).not.toContain("retry-turn");
   });
 });
 

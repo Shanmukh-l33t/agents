@@ -73,7 +73,10 @@ function toolCallIdOf(record: Record<string, unknown>): string | undefined {
  * message (text, a file, a tool call), in the same step or a later one, and
  * unsafe only at the end. This removes every reasoning part after the last
  * such part, then the `step-start` markers left with nothing after them.
- * Parts that send nothing to the model (sources, data parts) are kept.
+ * A text part with no text goes with it: it is the start of an answer the
+ * model never wrote, and a continuation would write its answer into it, in
+ * front of its own reasoning. Parts that send nothing to the model but that
+ * a client shows (sources, data parts) are kept.
  *
  * @returns The same message when it does not end in reasoning.
  */
@@ -90,12 +93,45 @@ export function stripTrailingReasoning<TMessage extends UIMessage>(
   }
   const tail = message.parts.slice(lastContent + 1);
   if (!tail.some((part) => part.type === "reasoning")) return message;
-  const kept = tail.filter((part) => part.type !== "reasoning");
+  const kept = tail.filter(
+    (part) => part.type !== "reasoning" && !isEmptyTextPart(part)
+  );
   while (kept.at(-1)?.type === "step-start") kept.pop();
   return {
     ...message,
     parts: [...message.parts.slice(0, lastContent + 1), ...kept]
   };
+}
+
+function isEmptyTextPart(part: UIMessage["parts"][number]): boolean {
+  return part.type === "text" && part.text.length === 0;
+}
+
+/**
+ * Whether a reply holds nothing: nothing a client can show and nothing a
+ * model request can carry. That is an assistant message with no parts, or
+ * with only `step-start` markers and text or reasoning parts that have no
+ * text. A reply cut off while the model was still reasoning is left like
+ * this once {@link stripTrailingReasoning} has run.
+ *
+ * Such a reply is not stored, and one that is stored is removed: a client
+ * draws it as an empty bubble, and nothing can continue it.
+ */
+export function replyIsEmpty(message: {
+  role: string;
+  parts: ReadonlyArray<unknown>;
+}): boolean {
+  return (
+    message.role === "assistant" &&
+    message.parts.every((part) => {
+      const record = part as { type?: unknown; text?: unknown };
+      if (record.type === "step-start") return true;
+      return (
+        (record.type === "text" || record.type === "reasoning") &&
+        (typeof record.text !== "string" || record.text.length === 0)
+      );
+    })
+  );
 }
 
 function countReasoning(message: UIMessage): number {
@@ -157,6 +193,12 @@ export interface RepairInterruptedToolPartsOptions {
    * `repairPart`. Defaults to `false`.
    */
   repairApprovalResponded?: boolean;
+  /**
+   * Do not report the last message as empty ({@link replyIsEmpty}). A
+   * continuation turn passes `true`: the last message is the one it writes
+   * into. Defaults to `false`.
+   */
+  keepEmptyLastMessage?: boolean;
 }
 
 export interface RepairInterruptedToolPartsResult {
@@ -173,6 +215,13 @@ export interface RepairInterruptedToolPartsResult {
    * ({@link stripTrailingReasoning}).
    */
   removedReasoningParts: number;
+  /**
+   * Ids of the assistant messages in `messages` that hold nothing
+   * ({@link replyIsEmpty}), whether this repair emptied them or they were
+   * stored that way. `messages` still lists them, in place. A caller that
+   * stores the result removes them ({@link persistRepairedTranscript}).
+   */
+  emptyReplyIds: string[];
 }
 
 /**
@@ -208,6 +257,7 @@ export function repairInterruptedToolParts(
   let normalizedInputs = 0;
   let removedReasoningParts = 0;
   const toolCallIds: string[] = [];
+  const emptyReplyIds: string[] = [];
   const repaired: UIMessage[] = [];
 
   for (const [messageIndex, message] of messages.entries()) {
@@ -308,6 +358,12 @@ export function repairInterruptedToolParts(
         countReasoning(settled) - countReasoning(stripped);
     }
     repaired.push(stripped);
+    if (
+      replyIsEmpty(stripped) &&
+      !(options.keepEmptyLastMessage && isLastMessage)
+    ) {
+      emptyReplyIds.push(stripped.id);
+    }
   }
 
   return {
@@ -315,7 +371,8 @@ export function repairInterruptedToolParts(
     removedToolCalls,
     normalizedInputs,
     toolCallIds,
-    removedReasoningParts
+    removedReasoningParts,
+    emptyReplyIds
   };
 }
 
@@ -342,6 +399,9 @@ export function repairInterruptedToolParts(
  * Do NOT call this on a reply whose stream finished. There, an unanswered
  * call is one the stream ended on, so it is waiting for a client, whether or
  * not the client ever sent that tool's schema.
+ *
+ * The result can be empty ({@link replyIsEmpty}), for a reply cut off while
+ * the model was still reasoning. The caller must not store it.
  *
  * @returns The same message when nothing changed.
  */
@@ -383,6 +443,13 @@ export interface RepairedTranscriptSink {
    * @param repaired - The whole list the repair ran on, repaired.
    */
   persist(changed: UIMessage[], repaired: UIMessage[]): Promise<void>;
+  /**
+   * Remove stored messages and tell every client, so each tab drops them.
+   *
+   * @param ids - The messages to remove.
+   * @param repaired - The list the repair ran on, repaired, without them.
+   */
+  remove(ids: string[], repaired: UIMessage[]): Promise<void>;
   /** Emit the `chat:transcript:repaired` observability event. */
   emitRepaired(event: {
     removedToolCalls: number;
@@ -393,25 +460,35 @@ export interface RepairedTranscriptSink {
 }
 
 /**
- * Store what a repair changed and report it, once. Does nothing when the
- * repair changed nothing, which is the common case.
+ * Store what a repair changed and report it, once. A reply the repair
+ * found or left empty ({@link replyIsEmpty}) is removed, not stored. Does
+ * nothing when the repair changed nothing, which is the common case.
+ *
+ * @returns The repaired messages without the removed ones. The same array
+ *   as `result.messages` when none was removed.
  */
 export async function persistRepairedTranscript(
   original: ReadonlyArray<UIMessage>,
   result: RepairInterruptedToolPartsResult,
   sink: RepairedTranscriptSink
-): Promise<void> {
+): Promise<UIMessage[]> {
+  const removed = new Set(result.emptyReplyIds);
+  const kept =
+    removed.size === 0
+      ? result.messages
+      : result.messages.filter((message) => !removed.has(message.id));
+  const changed = result.messages.filter(
+    (message, index) => message !== original[index] && !removed.has(message.id)
+  );
+  if (changed.length > 0) await sink.persist(changed, kept);
+  if (removed.size > 0) await sink.remove([...removed], kept);
   if (
     result.removedToolCalls === 0 &&
     result.normalizedInputs === 0 &&
     result.removedReasoningParts === 0
   ) {
-    return;
+    return kept;
   }
-  const changed = result.messages.filter(
-    (message, index) => message !== original[index]
-  );
-  await sink.persist(changed, result.messages);
   sink.emitRepaired({
     removedToolCalls: result.removedToolCalls,
     normalizedInputs: result.normalizedInputs,
@@ -420,6 +497,7 @@ export async function persistRepairedTranscript(
       removedReasoningParts: result.removedReasoningParts
     })
   });
+  return kept;
 }
 
 /**
@@ -433,29 +511,37 @@ export async function persistRepairedTranscript(
  * attempt continues and settling changes it (`cutOffReplyToSettle`). Earlier replies are left alone: the conversation has
  * moved past them, nothing waits on them, and the turn that follows settles
  * what they left unanswered.
+ *
+ * A reply that is empty once settled ({@link replyIsEmpty}) is removed.
+ * There is then nothing to continue, and the attempt retries the question.
+ *
+ * @returns `"removed"` when the reply was removed.
  */
 export async function settleReplyBeforeRecovery(
   messages: ReadonlyArray<UIMessage>,
   continueReplyId: string,
   options: SettleInterruptedReplyOptions,
   sink: RepairedTranscriptSink
-): Promise<void> {
+): Promise<"removed" | undefined> {
   let result: RepairInterruptedToolPartsResult | undefined;
   const change = cutOffReplyToSettle(messages, continueReplyId, (reply) => {
     result = settleInterruptedReplyParts(reply, options);
     return result.messages[0];
   });
-  if (!change || !result) return;
+  if (!result) return undefined;
+  // A reply stored empty settles to itself, and is still removed.
+  if (!change && result.emptyReplyIds.length === 0) return undefined;
   await persistRepairedTranscript(
     messages,
     {
       ...result,
       messages: messages.map((message) =>
-        message === change.stored ? change.settled : message
+        message === change?.stored ? change.settled : message
       )
     },
     sink
   );
+  return result.emptyReplyIds.length > 0 ? "removed" : undefined;
 }
 
 /**

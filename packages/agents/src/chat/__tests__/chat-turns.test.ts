@@ -481,7 +481,11 @@ describe("ChatTurns", () => {
       ({ ...part, state: "output-error" }) as UIMessage["parts"][number];
     const stateOf = (message: UIMessage) =>
       (message.parts[0] as { state?: string }).state;
-    const noSink = { persist: async () => {}, emitRepaired: () => {} };
+    const noSink = {
+      persist: async () => {},
+      remove: async () => {},
+      emitRepaired: () => {}
+    };
     const repair = (messages: UIMessage[], continuation: boolean) =>
       turns.settleBeforeTurn(
         messages,
@@ -556,6 +560,7 @@ describe("ChatTurns", () => {
         persist: async (changed: UIMessage[]) => {
           stored.push(changed.map((message) => message.id));
         },
+        remove: async () => {},
         emitRepaired: (event: unknown) => void events.push(event)
       };
 
@@ -600,6 +605,7 @@ describe("ChatTurns", () => {
         persist: async (changed: UIMessage[]) => {
           stored.push(changed.map((message) => message.id));
         },
+        remove: async () => {},
         emitRepaired: () => {}
       };
 
@@ -607,6 +613,53 @@ describe("ChatTurns", () => {
       expect(stored).toEqual([]);
       await turns.settleBeforeRecovery(messages, "a1", flip, sink);
       expect(stored).toEqual([["a1"]]);
+    });
+
+    it("removes a reply the repair left empty and returns the list without it", async () => {
+      const removed: string[][] = [];
+      const messages: UIMessage[] = [
+        { id: "u1", role: "user", parts: [{ type: "text", text: "q" }] },
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [{ type: "step-start" }, { type: "reasoning", text: "hm" }]
+        },
+        { id: "u2", role: "user", parts: [{ type: "text", text: "next" }] }
+      ];
+
+      const result = await turns.settleBeforeTurn(
+        messages,
+        { continuation: false, repairPart: flip },
+        {
+          persist: async () => {
+            throw new Error("an empty reply is removed, not stored");
+          },
+          remove: async (ids) => void removed.push(ids),
+          emitRepaired: () => {}
+        }
+      );
+
+      expect(removed).toEqual([["a1"]]);
+      expect(result.messages.map((message) => message.id)).toEqual([
+        "u1",
+        "u2"
+      ]);
+    });
+
+    it("says a reply that is only reasoning has nothing to continue", () => {
+      const reasoningOnly: UIMessage = {
+        id: "a1",
+        role: "assistant",
+        parts: [{ type: "step-start" }, { type: "reasoning", text: "hm" }]
+      };
+      const answered: UIMessage = {
+        id: "a1",
+        role: "assistant",
+        parts: [{ type: "text", text: "answer" }]
+      };
+      expect(turns.replyToContinueIsEmpty([reasoningOnly])).toBe(true);
+      expect(turns.replyToContinueIsEmpty([answered])).toBe(false);
+      expect(turns.replyToContinueIsEmpty([])).toBe(false);
     });
   });
 

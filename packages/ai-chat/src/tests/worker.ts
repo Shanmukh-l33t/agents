@@ -1664,7 +1664,7 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
           if (format === "sse") {
             const chunk = JSON.stringify({
               type: "text-delta",
-              textDelta: `chunk-${i} `
+              delta: `chunk-${i} `
             });
             controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
           } else {
@@ -2218,7 +2218,7 @@ export class ResponseAgent extends AIChatAgent<Env> {
           if (format === "sse") {
             const chunk = JSON.stringify({
               type: "text-delta",
-              textDelta: `chunk-${i} `
+              delta: `chunk-${i} `
             });
             controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
           } else {
@@ -3949,6 +3949,12 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     body?: Record<string, unknown>
   ): Promise<{ requestId: string; status: string }> {
     return this.continueLastTurn(body);
+  }
+
+  async runRecoveryContinueForTest(options?: {
+    targetAssistantId?: string;
+  }): Promise<void> {
+    await this._chatRecoveryContinueDetached(options);
   }
 
   async runRecoveryRetryForTest(options?: {

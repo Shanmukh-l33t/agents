@@ -259,7 +259,12 @@ import {
   type ChatRecoveryKind
 } from "agents/chat";
 import type { Streams } from "agents/streams";
-import type { ContinuationTurn, TurnFailureHost } from "agents/chat";
+import type {
+  ContinuationTurn,
+  RecoveryLeafCheck,
+  TurnFailureHost
+} from "agents/chat";
+import { replyIsEmpty, stripTrailingReasoning } from "agents/chat";
 import type {
   BeforeTurnRepairResult,
   RepairedTranscriptSink,
@@ -4166,7 +4171,8 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * How a repaired transcript is stored and reported: update each changed
    * message in the Session, patch the cached copy by id (the repaired list
    * can be a cut or off-cache path), broadcast, then the
-   * `chat:transcript:repaired` event. Repair never deletes a message.
+   * `chat:transcript:repaired` event. A reply the repair left empty is
+   * removed.
    */
   private _repairedTranscriptSink(): RepairedTranscriptSink {
     return {
@@ -4177,6 +4183,13 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         for (const message of changed) {
           this._patchCachedMessage(await this._updateMessageInHistory(message));
         }
+        this._broadcastMessages();
+      },
+      // The Session splices a removed message's children onto its parent.
+      // The broadcast carries the whole list, so every tab drops it.
+      remove: async (ids) => {
+        await this.session.deleteMessages(ids);
+        await this._syncMessages();
         this._broadcastMessages();
       },
       emitRepaired: (event) => this._emit("chat:transcript:repaired", event)
@@ -12580,10 +12593,14 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       // anything: while the reply still waits on a client there is nothing
       // to continue, and a skipped call leaves the chat as it found it. The
       // client's answer starts the continuation.
+      // A reply that holds nothing once its trailing reasoning is gone has
+      // nothing to continue either. The next new reply removes it.
       prepare: async () =>
         this._turns.continuationWaitsOnClient()
           ? { declined: "skipped", reason: "awaiting-client" }
-          : { input: [] },
+          : this._turns.replyToContinueIsEmpty(this.messages)
+            ? { declined: "skipped", reason: "nothing-to-continue" }
+            : { input: [] },
       model: {
         continuation: true,
         workflowPrompt,
@@ -14488,11 +14505,11 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    */
   private _strippedForPersist(msg: UIMessage): UIMessage | null {
     const stripped = this._stripInternalFinalAnswerParts(msg);
-    if (stripped === msg) return msg;
-    const hasMeaningfulParts = stripped.parts.some(
-      (part) => (part as { type?: string }).type !== "step-start"
-    );
-    return hasMeaningfulParts ? stripped : null;
+    // A reply that holds nothing a client can show and nothing a model
+    // request can carry is not stored (the shared `replyIsEmpty`): one cut
+    // off while the model was still reasoning, or one that was only an
+    // internal final answer.
+    return replyIsEmpty(stripped) ? null : stripped;
   }
 
   /**
@@ -14518,7 +14535,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * nothing waits on them, and the turn that follows settles what they left
    * unanswered.
    */
-  private _settleBeforeRecovery(continueReplyId: string): Promise<void> {
+  private _settleBeforeRecovery(
+    continueReplyId: string
+  ): Promise<"removed" | undefined> {
     return this._turns.settleBeforeRecovery(
       this.messages,
       continueReplyId,
@@ -16380,19 +16399,22 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     snapshot: ChatFiberSnapshot | null,
     partial: { text: string; parts: unknown[] }
   ): Promise<string | null> {
-    // A partial holding only the internal final-answer tool persists nothing,
-    // so the user message stays the leaf and there is nothing to continue.
+    // A partial that holds only the internal final-answer tool, or only the
+    // reasoning the model was cut off in, persists nothing. The user message
+    // stays the leaf and there is nothing to continue.
     if (
       !snapshot ||
       snapshot.continuation ||
       !snapshot.latestUserMessageId ||
       partial.text ||
       (partial.parts.length > 0 &&
-        this._strippedForPersist({
-          id: "",
-          role: "assistant",
-          parts: partial.parts as UIMessage["parts"]
-        }) !== null)
+        this._strippedForPersist(
+          stripTrailingReasoning({
+            id: "",
+            role: "assistant",
+            parts: partial.parts as UIMessage["parts"]
+          })
+        ) !== null)
     ) {
       return null;
     }
@@ -16580,43 +16602,21 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     data?: ChatRecoveryRetryData,
     onTurnStarted?: () => void
   ): Promise<void> {
-    const regeneratedLeafId = data?.regeneratedLeafId;
     const host = this._recoveredTurnHost("_chatRecoveryRetry", data);
     await this._chatRecoveryEngine().runRecoveredTurn({
       ...host,
-      checkLeaf: async () => {
-        const lastLeaf = await this.session.getLatestLeaf();
-        if (
-          !lastLeaf ||
-          (regeneratedLeafId === undefined && lastLeaf.role !== "user")
-        ) {
-          // The user turn is no longer the leaf: it was answered, or the
-          // conversation moved on.
-          return { moved: true, reason: "no_unanswered_user_message" };
-        }
-        const expectedLeafId = regeneratedLeafId ?? data?.targetUserId;
-        if (expectedLeafId && lastLeaf.id !== expectedLeafId) {
-          return { moved: true, reason: "conversation_changed" };
-        }
-        return { moved: false };
-      },
+      ...this._recoveryRetrySteps(
+        host,
+        data,
+        {
+          targetUserId: data?.targetUserId,
+          regeneratedLeafId: data?.regeneratedLeafId
+        },
+        onTurnStarted
+      ),
       // Being superseded is benign: the submission ends `skipped`, never
       // `error`.
       onSkipped: () => host.completeSubmission("skipped", null, null),
-      runTurn: (signal) =>
-        this._runRecoveredTurnAfterAcceptance(
-          host.submission(),
-          onTurnStarted,
-          () =>
-            this._retryLastUserTurn({
-              ...this._recoveredTurnContext(data),
-              signal: host.turnSignal(signal),
-              trigger: "recovery-retry",
-              ...(regeneratedLeafId !== undefined && {
-                branchParentId: data?.targetUserId
-              })
-            })
-        ),
       afterOutcome: (result) =>
         host.completeSubmission(
           result.status,
@@ -16627,6 +16627,58 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
           true
         )
     });
+  }
+
+  /**
+   * The leaf check and the turn of a recovery that answers the latest
+   * question again: a retry attempt, and a continue attempt whose reply held
+   * nothing and was removed.
+   */
+  private _recoveryRetrySteps(
+    host: {
+      submission(): ThinkSubmissionRow | null;
+      turnSignal(signal: AbortSignal): AbortSignal;
+    },
+    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined,
+    target: { targetUserId?: string; regeneratedLeafId?: string },
+    onTurnStarted?: () => void
+  ): {
+    checkLeaf(): Promise<RecoveryLeafCheck>;
+    runTurn(signal: AbortSignal): Promise<ProgrammaticMessagesResult>;
+  } {
+    const { regeneratedLeafId, targetUserId } = target;
+    return {
+      checkLeaf: async () => {
+        const lastLeaf = await this.session.getLatestLeaf();
+        if (
+          !lastLeaf ||
+          (regeneratedLeafId === undefined && lastLeaf.role !== "user")
+        ) {
+          // The user turn is no longer the leaf: it was answered, or the
+          // conversation moved on.
+          return { moved: true, reason: "no_unanswered_user_message" };
+        }
+        const expectedLeafId = regeneratedLeafId ?? targetUserId;
+        if (expectedLeafId && lastLeaf.id !== expectedLeafId) {
+          return { moved: true, reason: "conversation_changed" };
+        }
+        return { moved: false };
+      },
+      runTurn: (signal) =>
+        this._runRecoveredTurnAfterAcceptance(
+          host.submission(),
+          onTurnStarted,
+          () =>
+            this._retryLastUserTurn({
+              ...this._recoveredTurnContext(data),
+              signal: host.turnSignal(signal),
+              trigger: "recovery-retry",
+              ...(regeneratedLeafId !== undefined && {
+                branchParentId: targetUserId
+              })
+            })
+        )
+    };
   }
 
   /**
@@ -16862,9 +16914,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     let supersededByNewerUserTurn = false;
     await this._chatRecoveryEngine().runRecoveredTurn({
       ...host,
-      settleCutOffReply: async () => {
-        if (targetId) await this._settleBeforeRecovery(targetId);
-      },
+      settleCutOffReply: async () =>
+        targetId ? this._settleBeforeRecovery(targetId) : undefined,
+      // The reply held nothing and was removed: answer the question again.
+      retryLostReply: this._recoveryRetrySteps(host, data, {}, onTurnStarted),
       checkLeaf: async () => {
         const lastLeaf = await this.session.getLatestLeaf();
         if (!targetId || lastLeaf?.id === targetId) return { moved: false };

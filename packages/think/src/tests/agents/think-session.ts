@@ -2218,7 +2218,12 @@ export class ThinkTestAgent extends Think {
                   }
                   const { done, value } = await iterator.next();
                   if (done) return { done: true as const, value: undefined };
-                  chunkCount++;
+                  // Count from the first chunk of content. A reply cut off
+                  // before it has any (after `start` and `start-step` alone)
+                  // holds nothing and is not stored, and these tests are
+                  // about a partial reply that is.
+                  const type = (value as { type?: string } | null)?.type;
+                  if (type !== "start" && type !== "start-step") chunkCount++;
                   if (
                     midStreamHook &&
                     chunkCount === midStreamHook.afterChunks
@@ -11572,6 +11577,12 @@ export class ThinkRecoveryTestAgent extends Think {
     lastBody?: Record<string, unknown>;
   }): Promise<void> {
     await this._chatRecoveryRetryDetached(options);
+  }
+
+  async runRecoveryContinueForTest(options?: {
+    targetAssistantId?: string;
+  }): Promise<void> {
+    await this._chatRecoveryContinueDetached(options);
   }
 
   async runScheduledRecoveryRetryForTest(): Promise<void> {

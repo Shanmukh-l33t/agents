@@ -831,7 +831,7 @@ The optional `options.signal` accepts an external `AbortSignal` for cancellation
 
 Called automatically by the default recovery path. Can also be called manually from scheduled callbacks or other entry points. The optional `body` parameter merges with the saved `_lastBody`.
 
-When the call is skipped, `status` is `"skipped"` and `reason` says why: `"nothing-to-continue"` (no assistant message), `"cleared"` (the chat was cleared), or `"awaiting-client"` (the reply still waits on a client for a tool result or an approval). A skipped call changes nothing. See [When the user moves on without answering](./client-tools-continuation.md#when-the-user-moves-on-without-answering).
+When the call is skipped, `status` is `"skipped"` and `reason` says why: `"nothing-to-continue"` (no assistant message, or one that holds nothing once its trailing reasoning is gone), `"cleared"` (the chat was cleared), or `"awaiting-client"` (the reply still waits on a client for a tool result or an approval). A skipped call changes nothing. See [When the user moves on without answering](./client-tools-continuation.md#when-the-user-moves-on-without-answering).
 
 #### Stashing recovery data
 

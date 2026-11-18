@@ -7,7 +7,9 @@
  *
  * 1. Return if the user cancelled the incident while it was scheduled.
  * 2. Register the attempt, so a cancel by the original request id stops it.
- * 3. Settle the cut-off reply (continue only).
+ * 3. Settle the cut-off reply (continue only). A reply that settles to
+ *    nothing is removed, and the attempt goes on as a retry of the question
+ *    (`retryLostReply`), as recovery does when no part of a reply was stored.
  * 4. Wait until the chat is stable.
  * 5. A stop that landed meanwhile ends the attempt. So does a client's
  *    answer whose own turn continued the reply. Both come before the timeout
@@ -93,8 +95,23 @@ export interface RecoveredTurnHost<
    * Return `false` to skip the attempt. The host records why.
    */
   admit?(): Promise<boolean>;
-  /** Continue only: settle the dead tool calls of the cut-off reply. */
-  settleCutOffReply?(): Promise<void>;
+  /**
+   * Continue only: settle the dead tool calls of the cut-off reply.
+   *
+   * @returns `"removed"` when the reply held nothing once settled and was
+   *   removed. The attempt then runs {@link retryLostReply}.
+   */
+  settleCutOffReply?(): Promise<"removed" | undefined | void>;
+  /**
+   * Continue only: the leaf check and the turn of an attempt whose reply
+   * {@link settleCutOffReply} removed. The question is the latest message
+   * again, so the attempt answers it again. Continuing would find the
+   * conversation changed and skip, and the question would stay unanswered.
+   */
+  retryLostReply?: {
+    checkLeaf(): Promise<RecoveryLeafCheck>;
+    runTurn(signal: AbortSignal): Promise<TResult>;
+  };
   /** The user stopped the attempt, or cancelled it while it was scheduled. */
   onStopped?(): Promise<void>;
   /**
@@ -203,7 +220,9 @@ async function runAdmittedAttempt<
   };
 
   try {
-    await host.settleCutOffReply?.();
+    const replyRemoved = (await host.settleCutOffReply?.()) === "removed";
+    const steps =
+      replyRemoved && host.retryLostReply ? host.retryLostReply : host;
     const config = engine.resolveConfig();
     // The reply was settled above, so anything still pending is a call a
     // client can answer, and the timeout branch parks on it.
@@ -264,7 +283,7 @@ async function runAdmittedAttempt<
       return;
     }
 
-    const leaf = await host.checkLeaf();
+    const leaf = await steps.checkLeaf();
     if (leaf.moved) {
       await engine.updateIncident(incidentId, "skipped", leaf.reason);
       await host.onSkipped?.(leaf);
@@ -288,7 +307,7 @@ async function runAdmittedAttempt<
     // The turn stops for a user's stop, and for another turn that got to
     // continue the reply while this one waited in the queue.
     const turnSignal = AbortSignal.any([stop.signal, attempt.superseded]);
-    const result = await host.runTurn(turnSignal);
+    const result = await steps.runTurn(turnSignal);
 
     if (stop.signal.aborted) {
       await recordStop();

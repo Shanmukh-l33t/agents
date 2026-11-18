@@ -79,7 +79,12 @@ import {
   type ChatRecoveryTaskReason,
   type StreamInterruptionOutcome
 } from "agents/chat";
-import { type ClientToolSchema } from "agents/chat";
+import {
+  replyIsEmpty,
+  stripTrailingReasoning,
+  type ClientToolSchema,
+  type RecoveryLeafCheck
+} from "agents/chat";
 import {
   resolveChatRecoveryConfig,
   ChatRecoveryEngine,
@@ -1847,7 +1852,9 @@ export class AIChatAgent<
           message.id,
           fallbackId
         );
-        return settle(message);
+        const settled = settle(message);
+        // Nothing left to store (cut off while the model was reasoning).
+        return replyIsEmpty(settled) ? null : settled;
       },
       merge: (existing, incoming) =>
         settle(reconcileOrphanPartial(existing, incoming))
@@ -1875,6 +1882,15 @@ export class AIChatAgent<
       persist: async (_changed, repaired) => {
         await this.persistMessages(repaired);
       },
+      // `CF_AGENT_CHAT_MESSAGES` carries the whole list, so every tab
+      // drops what is no longer in it.
+      remove: async (ids) => {
+        await this._deleteMessagesByIds(ids);
+        this._broadcastChatMessage({
+          messages: this._messagesForClientSync(),
+          type: MessageType.CF_AGENT_CHAT_MESSAGES
+        });
+      },
       emitRepaired: (event) => this._emit("chat:transcript:repaired", event)
     };
   }
@@ -1890,7 +1906,9 @@ export class AIChatAgent<
    * nothing waits on them, and the turn that follows settles what they left
    * unanswered.
    */
-  private _settleBeforeRecovery(continueReplyId: string): Promise<void> {
+  private _settleBeforeRecovery(
+    continueReplyId: string
+  ): Promise<"removed" | undefined> {
     return this._turns.settleBeforeRecovery(
       this.messages,
       continueReplyId,
@@ -3756,10 +3774,14 @@ export class AIChatAgent<
       // anything: while the reply still waits on a client there is nothing
       // to continue, and a skipped call leaves the chat as it found it. The
       // client's answer starts the continuation.
+      // A reply that holds nothing once its trailing reasoning is gone has
+      // nothing to continue either. The next new reply removes it.
       prepare: async () =>
         this._turns.continuationWaitsOnClient()
           ? { declined: "skipped", reason: "awaiting-client" }
-          : { input: [] }
+          : this._turns.replyToContinueIsEmpty(this.messages)
+            ? { declined: "skipped", reason: "nothing-to-continue" }
+            : { input: [] }
     });
   }
 
@@ -4301,9 +4323,10 @@ export class AIChatAgent<
               reason
             )
         ),
-      settleCutOffReply: async () => {
-        if (targetId) await this._settleBeforeRecovery(targetId);
-      },
+      settleCutOffReply: async () =>
+        targetId ? this._settleBeforeRecovery(targetId) : undefined,
+      // The reply held nothing and was removed: answer the question again.
+      retryLostReply: this._recoveryRetrySteps(undefined, onTurnStarted),
       // The leaf is the last message, not the last assistant message: a newer
       // question that got no reply (stopped, or failed) also moved it, and
       // continuing would answer that question inside the old reply.
@@ -4477,12 +4500,29 @@ export class AIChatAgent<
               reason
             )
         ),
+      ...this._recoveryRetrySteps(data?.targetUserId, onTurnStarted)
+    });
+  }
+
+  /**
+   * The leaf check and the turn of a recovery that answers the latest
+   * question again: a retry attempt, and a continue attempt whose reply held
+   * nothing and was removed.
+   */
+  private _recoveryRetrySteps(
+    targetUserId: string | undefined,
+    onTurnStarted?: () => void
+  ): {
+    checkLeaf(): Promise<RecoveryLeafCheck>;
+    runTurn(signal: AbortSignal): Promise<SaveMessagesResult>;
+  } {
+    return {
       checkLeaf: async () => {
         const lastMessage = this.messages.at(-1);
         if (!lastMessage || lastMessage.role !== "user") {
           return { moved: true, reason: "no_unanswered_user_message" };
         }
-        if (data?.targetUserId && lastMessage.id !== data.targetUserId) {
+        if (targetUserId && lastMessage.id !== targetUserId) {
           return { moved: true, reason: "conversation_changed" };
         }
         return { moved: false };
@@ -4493,7 +4533,7 @@ export class AIChatAgent<
         onTurnStarted?.();
         return this._retryLastUserTurn({ signal });
       }
-    });
+    };
   }
 
   /**
@@ -5976,8 +6016,13 @@ export class AIChatAgent<
               // continuation re-anchors onto it via `targetAssistantId`. (Unlike a
               // cold deploy recovery, there is no need to reconstruct from stored
               // chunks here — the live `message` is authoritative.)
-              const targetAssistantId =
-                message.parts.length > 0 ? message.id : undefined;
+              // A reply that holds nothing once its trailing reasoning is
+              // gone is not stored, so recovery retries the question.
+              const targetAssistantId = replyIsEmpty(
+                stripTrailingReasoning(message)
+              )
+                ? undefined
+                : message.id;
               const outcome = await this._routeStreamInterruption({
                 requestId: id,
                 streamId,
@@ -6090,8 +6135,10 @@ export class AIChatAgent<
           if (streamResult.status !== "completed") {
             message = this._settleInterruptedReply(message);
           }
+          // A reply that holds nothing (cut off while the model was still
+          // reasoning) is not stored: a client would draw an empty bubble.
           if (
-            message.parts.length > 0 &&
+            !replyIsEmpty(message) &&
             !discardPartial &&
             !resetSinceTurnStarted()
           ) {

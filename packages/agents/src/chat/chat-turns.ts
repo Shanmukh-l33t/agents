@@ -46,6 +46,7 @@ import {
 } from "./auto-continuation-controller";
 import {
   continuationWaitsOnClient,
+  replyToContinueIsEmpty,
   repairTranscriptBeforeTurn,
   type BeforeTurnRepairOptions,
   type BeforeTurnRepairResult
@@ -680,8 +681,20 @@ export class ChatTurns<
       ...options,
       clientToolNames: this.host.clientToolNames()
     });
-    await persistRepairedTranscript(messages, result, sink);
-    return result;
+    // Without the replies that hold nothing: the repair removed them.
+    return {
+      ...result,
+      messages: await persistRepairedTranscript(messages, result, sink)
+    };
+  }
+
+  /**
+   * Whether the message a continuation turn would continue holds nothing
+   * once its trailing reasoning is gone, so there is nothing to continue.
+   * See {@link replyToContinueIsEmpty}.
+   */
+  replyToContinueIsEmpty(messages: ReadonlyArray<UIMessage>): boolean {
+    return replyToContinueIsEmpty(messages);
   }
 
   /**
@@ -708,7 +721,7 @@ export class ChatTurns<
     continueReplyId: string,
     repairPart: RepairInterruptedToolPartsOptions["repairPart"],
     sink: RepairedTranscriptSink
-  ): Promise<void> {
+  ): Promise<"removed" | undefined> {
     return settleReplyBeforeRecovery(
       messages,
       continueReplyId,

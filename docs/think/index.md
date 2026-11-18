@@ -654,6 +654,8 @@ This covers a client tool call or approval request the user never answered befor
 
 The same repair removes the reasoning a reply ends in. A reply cut off right after the model's reasoning would otherwise fail every later request on Anthropic, which rejects an assistant message whose final block is a thinking block.
 
+A reply that holds nothing once that reasoning is gone (it was cut off while the model was still reasoning) is not stored, and one that is already stored is removed. Refer to [A reply that holds nothing](../agents/client-tools-continuation.md#a-reply-that-holds-nothing).
+
 Override `repairInterruptedToolPart` to customize the repaired shape. The common case is a client-resolved tool — for example an `ask_user` question that has no server `execute` and is normally answered by the user's next message. Converting it to a plain text part lets the model treat it as ordinary conversation rather than a tool error, and keeps the question verbatim through compaction:
 
 ```typescript

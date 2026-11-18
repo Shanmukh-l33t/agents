@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { UIMessage } from "ai";
 import {
   continuationWaitsOnClient,
+  replyToContinueIsEmpty,
   interruptedToolPartAsError,
   INTERRUPTED_TOOL_ERROR_TEXT,
   repairTranscriptBeforeTurn
@@ -356,5 +357,51 @@ describe("interruptedToolPartAsError", () => {
       errorText:
         "The conversation moved on before this tool call was approved or denied. It did not run."
     });
+  });
+});
+
+describe("a reply that holds nothing", () => {
+  const reasoningOnly = (id: string): UIMessage => ({
+    id,
+    role: "assistant",
+    parts: [{ type: "step-start" }, { type: "reasoning", text: "Let me think" }]
+  });
+
+  it("is reported for removal by a turn that starts a new reply", () => {
+    const result = repair(
+      [user("u1"), reasoningOnly("a1"), user("u2")],
+      newReply
+    );
+    expect(result.emptyReplyIds).toEqual(["a1"]);
+  });
+
+  it("is reported when it is the last message of a new reply's turn", () => {
+    const result = repair([user("u1"), reasoningOnly("a1")], newReply);
+    expect(result.emptyReplyIds).toEqual(["a1"]);
+  });
+
+  it("is kept as the last message of a continuation turn, which writes into it", () => {
+    const result = repair([user("u1"), reasoningOnly("a1")], continuation);
+    expect(result.emptyReplyIds).toEqual([]);
+  });
+
+  it("is still reported in an earlier position of a continuation turn", () => {
+    const result = repair(
+      [
+        user("u1"),
+        reasoningOnly("a1"),
+        user("u2"),
+        reply("a2", { type: "text", text: "answer" })
+      ],
+      continuation
+    );
+    expect(result.emptyReplyIds).toEqual(["a1"]);
+  });
+
+  it("has nothing to continue", () => {
+    expect(replyToContinueIsEmpty([user("u1"), reasoningOnly("a1")])).toBe(
+      true
+    );
+    expect(replyToContinueIsEmpty([user("u1")])).toBe(false);
   });
 });
