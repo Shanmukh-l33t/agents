@@ -29,6 +29,7 @@
 import type { AbortRegistry } from "./abort-registry";
 import type { SaveMessagesResult } from "./lifecycle";
 import type { TurnQueue } from "./turn-queue";
+import { isTurnStopped } from "./turn-stop";
 
 export type ServerTurnStatus = SaveMessagesResult["status"];
 
@@ -84,6 +85,8 @@ export interface ServerChatTurn<TInput = undefined> {
   /**
    * Call the model and stream the reply. `signal` aborts when the turn is
    * stopped or the chat is reset. Return nothing when there was no reply.
+   * What it throws after `signal` aborted is the stop, not a failure
+   * ({@link isTurnStopped}): the turn ends `aborted`.
    */
   run(signal: AbortSignal, input: TInput): Promise<ServerTurnOutcome | void>;
   /**
@@ -190,7 +193,14 @@ export async function runServerTurn<TInput = undefined>(
       if (endsHere()) return;
     }
     touched = true;
-    const ran = await turn.run(signal, input);
+    let ran: ServerTurnOutcome | void = undefined;
+    try {
+      ran = await turn.run(signal, input);
+    } catch (error) {
+      // What a stopped turn throws because of the stop is not a failure:
+      // the turn ends `aborted`, like one stopped before `run`.
+      if (!isTurnStopped(signal)) throw error;
+    }
     if (ran) {
       outcome = ran;
       reported = true;
