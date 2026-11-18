@@ -820,6 +820,8 @@ override async onChatResponse(result: ChatResponseResult): Promise<void> {
 
 Appends to the last assistant message by re-calling `onChatMessage` with the saved request body. The response is streamed as a continuation — appended to the existing assistant message, not a new one. No synthetic user message is created.
 
+When the message was cut off in the middle of a text or reasoning part, that part is closed as it is. The continuation's reasoning and text are added as new parts after it, in the order the model writes them, and a connected client receives `text-start` for the new text part. `Think` does the same.
+
 ```typescript
 protected continueLastTurn(
   body?: Record<string, unknown>,

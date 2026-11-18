@@ -765,6 +765,53 @@ describe("chat turn races", () => {
     otherTab.close(1000);
   });
 
+  it("a tab is sent the text-start of a continuation that follows a cut-off text part", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    // The tab that sends the result is offered the stream to resume. Another
+    // tab gets its chunks as they are broadcast.
+    const { ws: otherTab } = await connectChatWS(
+      `/agents/test-chat-agent/${room}`
+    );
+    const seen = record(otherTab);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    // The reply was cut off in its text, after a client tool call.
+    const cutOff: ChatMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-testTool",
+          toolCallId: "call-1",
+          state: "input-available",
+          input: {}
+        },
+        { type: "text", text: "Partial ", state: "streaming" }
+      ] as ChatMessage["parts"]
+    };
+    await agent.persistMessages([user1, cutOff]);
+
+    send(ws, toolResult("call-1"));
+    await waitUntil(
+      async () => (await agent.getChatMessageCallCountForTest()) === 1
+    );
+    await agent.waitForIdleForTest();
+
+    // The continuation's text is a part of its own, so the tab is told when
+    // it starts. It used to get deltas for the old part and no start.
+    const chunks = seen
+      .filter(isUseChatResponseMessage)
+      .map((m) => m.body)
+      .filter((body) => body.length > 0);
+    expect(chunks.some((body) => body.includes('"text-start"'))).toBe(true);
+    const stored = (await agent.getPersistedMessages()) as ChatMessage[];
+    const texts = stored[1].parts.filter((part) => part.type === "text");
+    expect(texts[0]).toMatchObject({ text: "Partial ", state: "done" });
+    expect(texts.length).toBe(2);
+    ws.close(1000);
+    otherTab.close(1000);
+  });
+
   it("a reply stopped right after the model's reasoning is stored without it", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);

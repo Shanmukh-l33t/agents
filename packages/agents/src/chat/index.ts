@@ -5,6 +5,7 @@ export {
   isReplayChunk,
   lateToolInputForwardChunks,
   normalizeToolInput,
+  settleInterruptedPart,
   type MessageParts,
   type MessagePart,
   type StreamChunkData

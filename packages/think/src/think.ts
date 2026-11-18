@@ -264,7 +264,11 @@ import type {
   RecoveryLeafCheck,
   TurnFailureHost
 } from "agents/chat";
-import { replyIsEmpty, stripTrailingReasoning } from "agents/chat";
+import {
+  replyIsEmpty,
+  settleInterruptedPart,
+  stripTrailingReasoning
+} from "agents/chat";
 import type {
   BeforeTurnRepairResult,
   RepairedTranscriptSink,
@@ -818,18 +822,6 @@ function streamErrorToString(error: unknown): string {
   } catch {
     return String(error);
   }
-}
-
-/**
- * A recovery continuation opens its own text and reasoning parts, and an end
- * chunk only closes the newest part of its type, so a part the interruption
- * left streaming would never be closed.
- */
-function settleInterruptedPart(part: UIMessage["parts"][number]) {
-  return (part.type === "text" || part.type === "reasoning") &&
-    part.state === "streaming"
-    ? { ...part, state: "done" as const }
-    : part;
 }
 
 /**

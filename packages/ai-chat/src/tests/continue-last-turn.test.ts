@@ -354,7 +354,7 @@ describe("continueLastTurn", () => {
     });
   });
 
-  it("should merge text into existing streaming text part (not create a new block)", async () => {
+  it("opens a new text part after the one the interruption cut off", async () => {
     const room = crypto.randomUUID();
     const agentStub = await getTestAgent(room);
     await agentStub.setRecoveryOverride({ continue: false });
@@ -391,10 +391,55 @@ describe("continueLastTurn", () => {
       (p: ChatMessage["parts"][number]) => p.type === "text"
     );
 
-    expect(textParts).toHaveLength(1);
-    expect((textParts[0] as { text: string }).text).toBe(
-      "BeginningContinued response."
-    );
+    // The cut-off part is closed and kept. The continuation writes its own.
+    expect(textParts).toEqual([
+      { type: "text", text: "Beginning", state: "done" },
+      { type: "text", text: "Continued response.", state: "done" }
+    ]);
+  });
+
+  it("puts a continuation's reasoning after the cut-off text, and its text after that", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getTestAgent(room);
+    await agentStub.setIncludeReasoning(true);
+    // Cut off after some text, with no reasoning before it. The continuation
+    // reasons first. Its text used to be written into the old part, which
+    // left the reply as text, then reasoning.
+    await agentStub.persistMessages([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Tell me a story" }]
+      },
+      {
+        id: "assistant-cut-off",
+        role: "assistant",
+        parts: [
+          { type: "step-start" },
+          { type: "text", text: "Partial ", state: "streaming" }
+        ]
+      }
+    ] as ChatMessage[]);
+
+    await agentStub.callContinueLastTurn();
+    await agentStub.waitForIdleForTest();
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const assistant = messages.find(
+      (m: ChatMessage) => m.id === "assistant-cut-off"
+    )!;
+    expect(
+      assistant.parts.map((part) => [
+        part.type,
+        (part as { text?: string }).text
+      ])
+    ).toEqual([
+      ["step-start", undefined],
+      ["text", "Partial "],
+      ["reasoning", "Thinking about continuation."],
+      ["text", "Continued response."]
+    ]);
+    expect(assistant.parts.at(-1)?.type).not.toBe("reasoning");
   });
 
   it("should not merge text when existing text part is complete (state done)", async () => {
@@ -430,7 +475,7 @@ describe("continueLastTurn", () => {
     expect((textParts[1] as { text: string }).text).toBe("Continued response.");
   });
 
-  it("should merge reasoning into existing reasoning part during continuation", async () => {
+  it("keeps a cut-off reply's reasoning and text, and appends the continuation's after them", async () => {
     const room = crypto.randomUUID();
     const agentStub = await getTestAgent(room);
     await agentStub.setRecoveryOverride({ continue: false });
@@ -477,24 +522,17 @@ describe("continueLastTurn", () => {
       (m: ChatMessage) => m.role === "assistant"
     )!;
 
-    const reasoningParts = assistant.parts.filter(
-      (p: ChatMessage["parts"][number]) => p.type === "reasoning"
-    );
-    expect(reasoningParts).toHaveLength(1);
-    expect((reasoningParts[0] as { text: string }).text).toContain(
-      "Original thinking."
-    );
-    expect((reasoningParts[0] as { text: string }).text).toContain(
-      "Thinking about continuation."
-    );
-
-    const textParts = assistant.parts.filter(
-      (p: ChatMessage["parts"][number]) => p.type === "text"
-    );
-    expect(textParts).toHaveLength(1);
-    expect((textParts[0] as { text: string }).text).toBe(
-      "Partial answerContinued response."
-    );
+    expect(
+      assistant.parts.map((part) => [
+        part.type,
+        (part as { text?: string }).text
+      ])
+    ).toEqual([
+      ["reasoning", "Original thinking."],
+      ["text", "Partial answer"],
+      ["reasoning", "Thinking about continuation."],
+      ["text", "Continued response."]
+    ]);
   });
 
   it("should preserve orphaned continuation reasoning as a new part after completed reasoning", async () => {
