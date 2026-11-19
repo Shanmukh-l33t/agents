@@ -62,14 +62,40 @@ export async function errorFromResponse(
   );
 }
 
+/** A body whose failures are converted as they surface. */
+function liftBody(
+  body: ReadableStream<Uint8Array>
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        // `run` has already resolved, so this is the only place a body-time
+        // failure (a resume that gave up) can be lifted.
+        controller.error(toAISDKError(error));
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+}
+
 /**
  * Builds the transport for a set of provider settings, with every failure
  * lifted into the AI SDK error type.
  */
 export function createTransport(settings: AISettings): Transport {
   const inner = createCoreTransport(settings);
+  // A wrapped response is not the one `logIdFallback` was keyed on.
+  const originals = new WeakMap<Response, Response>();
   return {
-    logIdFallback: (response) => inner.logIdFallback(response),
+    logIdFallback: (response) =>
+      inner.logIdFallback(originals.get(response) ?? response),
     async native(request) {
       try {
         return await inner.native(request);
@@ -79,7 +105,11 @@ export function createTransport(settings: AISettings): Transport {
     },
     async run(request) {
       try {
-        return await inner.run(request);
+        const response = await inner.run(request);
+        if (response.body === null) return response;
+        const lifted = new Response(liftBody(response.body), response);
+        originals.set(lifted, response);
+        return lifted;
       } catch (error) {
         throw toAISDKError(error);
       }
